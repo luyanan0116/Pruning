@@ -1,0 +1,7 @@
+num_bands: 5
+num_buckets: 20
+num_event_levels: 10
+lambda_risk: 0.1
+resource_budget: 0.9
+alpha_comp: 1.0
+gamma_threshold: 0.7

@@ -1,0 +1,19 @@
+# 基础张量与梯度运算
+torch>=2.0.0
+accelerate>=0.20.0
+
+# 频域分解与数学处理 (实现公式 5-7)
+numpy>=1.23.0
+scipy>=1.10.0
+
+# 稳健估计与互信息计算 (实现公式 28-31)
+scikit-learn>=1.2.0
+
+# 大模型加载与评估 (校准集处理)
+transformers>=4.30.0
+datasets>=2.12.0
+sentencepiece
+protobuf
+
+# 可选：性能监测
+tqdm
