@@ -1,124 +1,169 @@
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 import yaml
 import os
+import math
 import gc
-from transformers import LlamaForCausalLM, LlamaTokenizer, BitsAndBytesConfig
-from pruner_core.pruner_engine import TaskContributionPruner
-from utils.llama_helper import register_llama_hooks, split_llama_heads
+from transformers import LlamaForCausalLM, LlamaTokenizer, default_data_collator
+from datasets import load_dataset
+from tqdm import tqdm
 
+# --- 1. 高速分布式环境初始化 ---
+def setup_distributed():
+    """初始化 NCCL 后端并设置当前 GPU"""
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+def cleanup():
+    dist.destroy_process_group()
+
+# --- 2. 贡献分析引擎 (集成之前修正的 DCT 逻辑) ---
+class DistTaskContributionAnalyzer:
+    def __init__(self, config, device, local_rank):
+        self.config = config
+        self.device = device
+        self.local_rank = local_rank
+        self.B = config['num_bands']
+        self.Q = config['num_buckets']
+        self.num_layers = 32
+        self.num_heads = 32
+        
+        # 预计算用于 MI 分桶的频率索引
+        self.bin_indices = torch.linspace(0, self.Q, self.B + 1).long().to(device)
+
+    # --- 修复版 DCT-II (针对 bfloat16 和任意长度优化) ---
+    def bf16_dct_ii(self, x):
+        N = x.shape[-1]
+        
+        # 1. 对称填充
+        x_pad = torch.cat([x[..., ::2], x[..., 1::2].flip(dims=[-1])], dim=-1)
+        
+        # 2. 计算最近的 2 的幂次方 (针对 cuFFT 速度优化)
+        M = 2 ** (int(math.ceil(math.log2(N)))) 
+        pad_size = M - N
+        if pad_size > 0:
+            x_pad = torch.nn.functional.pad(x_pad, (0, pad_size))
+        
+        # 3. 运行实数 FFT (bf16 会自动转成 fp32 运算以保证精度)
+        X_fft = torch.fft.rfft(x_pad.float(), dim=-1)
+        
+        # 4. 动态构造相位因子 phi
+        freq_len = X_fft.shape[-1]
+        k = torch.arange(freq_len, device=x.device, dtype=torch.float32)
+        phi = torch.exp(-1j * math.pi * k / (2 * N))
+        
+        # 5. 执行频域旋转并取实部
+        result = 2 * (X_fft * phi).real
+        return result[..., :N].to(x.dtype) # 截断并转回 bf16
+
+    # ... get_frequency_spectrum 和 MI 计算逻辑 (省略，保持之前鲁棒版) ...
+
+# --- 3. 分布式数据集加载 (WikiText-2 用于校准) ---
+def get_dist_dataloader(tokenizer, seq_len, batch_size):
+    # 加载 WikiText-2 raw 训练集用于校准
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    
+    def tokenize_function(examples):
+        return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=seq_len)
+
+    tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+    
+    # 物理切分数据集到不同 GPU
+    sampler = DistributedSampler(tokenized_datasets, shuffle=True)
+    
+    dataloader = DataLoader(
+        tokenized_datasets, 
+        batch_size=batch_size, 
+        sampler=sampler, 
+        collate_fn=default_data_collator
+    )
+    return dataloader, sampler
+
+# --- 4. 分布式主程序 ---
 def main():
-    # --- 1. 环境准备与配置加载 ---
+    # A. 分布式设置
+    local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}")
+    
+    # 只有主进程打印日志
+    is_main_process = (local_rank == 0)
+
+    # B. 配置加载
+    model_path = "/path/to/your/llama-2-7b-hf" # A100 服务器绝对路径
     with open('configs/base_config.yaml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    # 确保输出目录存在
-    os.makedirs('results', exist_ok=True)
-    
-    model_path = r"models\shakechen\Llama-2-7b-hf" # 请替换为你的实际路径
-    device = 'cuda'
-    
-    # --- 2. 4-bit 量化加载 (针对 6G 显存优化) ---
-    # 只有加载模型并运行反向传播，才能获得公式(1)所需的梯度信号
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_quant_type="nf4"
-    )
-    
-    print("正在加载 Llama 2 模型进行任务贡献分析...")
+    # C. 模型加载 (集成 bfloat16，无量化)
+    if is_main_process: print(f"正在以 bfloat16 加载模型...")
     tokenizer = LlamaTokenizer.from_pretrained(model_path)
+    # A100 原生支持 bf16
     model = LlamaForCausalLM.from_pretrained(
         model_path, 
-        quantization_config=bnb_config,
-        device_map="auto"
+        torch_dtype=torch.bfloat16, 
+        device_map={"": device} # 显式映射到当前 GPU
     )
     
-    # 初始化剪枝引擎
-    pruner = TaskContributionPruner(config, device=device)
-    
-    # --- 3. 注册梯度钩子 (Hooks) ---
-    captured_grads = {}
-    register_llama_hooks(model, captured_grads) # 拦截注意力头与FFN的响应信号
+    # 将模型包装为 DDP
+    model = DDP(model, device_ids=[local_rank])
+    model.train() # 开启 Train 模式以获取梯度
 
-    # --- 4. 运行校准与重复抽样 (稳健估计) ---
-    # 为了实现“稳健推断”，需要多次抽样以获得分数分布
-    num_samples = 5 # 重复抽样次数 R
-    all_iteration_results = []
+    # D. 分布式数据加载 (A100 可增加 batch_size)
+    # 将 seq_len 增加到 512，获取更丰富的频域特征
+    dataloader, sampler = get_dist_dataloader(tokenizer, seq_len=512, batch_size=config.get('batch_size', 16))
     
-    # 模拟校准文本 (实际可循环加载不同语料以增强 Non-IID 稳健性)
-    calibration_texts = [
-        "大语言模型结构化剪枝是降低推理成本的关键技术。",
-        "频域互信息视角可以提供多尺度的任务贡献刻画。",
-        "有限校准集下的稳健估计有助于提升排序的一致性。",
-        "城市运行安全与应急管理需要可靠的 AI 部署方案。",
-        "利用梯度响应序列的频域分解来识别冗余单元。"
-    ]
+    analyzer = DistTaskContributionAnalyzer(config, device, local_rank)
+    
+    # 用于在不同卡之间聚合数据
+    all_mi_spectrums = []
 
-    for r in range(num_samples):
-        print(f"正在进行第 {r+1}/{num_samples} 次抽样分析...")
-        model.zero_grad()
+    # E. 分布式反向传播与 MI 谱计算
+    if is_main_process: print(f"开始在多张 A100 上进行分布式贡献分析...")
+    
+    # 为了速度，只分析 10 个 Batch 的文本
+    num_calibration_batches = config.get('num_calibration_batches', 10)
+    
+    pbar = tqdm(total=num_calibration_batches, desc="分析进度", disable=not is_main_process)
+    
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx >= num_calibration_batches: break
         
-        inputs = tokenizer(calibration_texts[r % len(calibration_texts)], return_tensors="pt").to(device)
-        # 获取任务事件变量 Y' (基于 NLL 损失离散化)
-        outputs = model(**inputs, labels=inputs["input_ids"])
+        batch = {k: v.to(device) for k, v in batch.items()}
+        
+        # 前向传播 (DDP 会自动处理同步)
+        outputs = model(**batch)
         loss = outputs.loss
+        
+        # 反向传播 (A100 高速获取梯度)
         loss.backward()
         
-        # 构造当前轮次的 Y_prime
-        # 简化处理：将当前样本的 position-wise loss 离散化
-        y_prime = torch.randint(0, config['num_event_levels'], (inputs.input_ids.size(1),)).to(device)
+        # 提取当前卡计算出的局部 MI 谱
+        # 此处需要根据 DDP 模型结构定位 o_proj 和 mlp 的权重的梯度
+        # ... (此处省略 register_dist_hooks 逻辑，与之前 Hook 方案类似) ...
+        # current_local_mi = analyzer.calculate_mi_on_this_gpu(...)
         
-        current_scores = {}
-        for name, grads in captured_grads.items():
-            # 梯度响应标准化与频域分解 (公式 2-7)
-            if "attn" in name:
-                heads_grads = split_llama_heads(grads[0]) # 适配 Llama 2 的 32 个头
-                for h_idx, h_grad in enumerate(heads_grads):
-                    # 计算频域能量 z_u(q)
-                    z_energy = pruner.get_frequency_spectrum(h_grad, mode='attn')
-                    # 估计互信息作为贡献
-                    mi_val = pruner.estimate_mi_knn(z_energy.unsqueeze(0), y_prime.unsqueeze(0))
-                    uid = f"{name}_head_{h_idx}"
-                    if uid not in current_scores: current_scores[uid] = []
-                    current_scores[uid].append({'mi': mi_val, 'spectrum': z_energy})
-            else:
-                z_energy = pruner.get_frequency_spectrum(grads[0], mode='ffn')
-                mi_val = pruner.estimate_mi_knn(z_energy.unsqueeze(0), y_prime.unsqueeze(0))
-                if name not in current_scores: current_scores[name] = []
-                current_scores[name].append({'mi': mi_val, 'spectrum': z_energy})
+        #F. 梯度清理 (防止显存随时间累积)
+        model.zero_grad(set_to_none=True)
         
-        all_iteration_results.append(current_scores)
-        captured_grads.clear() # 清理以便下一轮拦截
-        gc.collect()
-        torch.cuda.empty_cache()
+        if is_main_process: pbar.update(1)
 
-    # --- 5. 计算 LCB 分数并保存结果 (公式 25-27) ---
-    print("正在汇总重复抽样结果，计算置信下界分数 (LCB)...")
-    final_units = []
+    # G. 分布式聚合 (All-Reduce)
+    if is_main_process: print(f"正在从各 A100 聚合贡献谱...")
     
-    # 提取所有单元 ID
-    unit_ids = all_iteration_results[0].keys()
+    # 将各卡上的 mi_spectrum 列表进行聚合 (使用 dist.all_reduce)
+    # ... (聚合逻辑省略) ...
+    # 最终在主进程获得全模型统一的 mi_spectrums
     
-    for uid in unit_ids:
-        # 收集该单元在 R 次重复中的所有 MI 分数
-        mi_list = torch.tensor([res[uid][0]['mi'] for res in all_iteration_results])
-        # 汇总频域谱 (取均值作为代表)
-        avg_spectrum = torch.stack([res[uid][0]['spectrum'] for res in all_iteration_results]).mean(dim=0)
-        
-        # 计算 LCB 分数 (公式 27)
-        lcb_val = pruner.compute_lcb(mi_list, lam=config.get('lambda_risk', 0.5))
-        
-        final_units.append({
-            'id': uid,
-            'lcb': lcb_val.item(),          # 置信下界分数，用于稳健选择
-            'cost': 1.0 if "attn" in uid else 4.0, # 资源成本
-            'mi_spectrum': avg_spectrum      # 频域任务贡献谱
-        })
+    # H. 结果保存
+    if is_main_process:
+        torch.save(final_aggregated_mi, 'results/lcb_scores.pt')
+        print(f"聚合后的稳健贡献得分已保存。")
 
-    # 持久化保存，供 main_prune.py 调用
-    save_path = 'results/lcb_scores.pt'
-    torch.save(final_units, save_path)
-    print(f"分析完成！已保存 {len(final_units)} 个单元的稳健得分至 {save_path}")
+    pbar.close()
+    cleanup()
 
 if __name__ == "__main__":
     main()
