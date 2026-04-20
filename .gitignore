@@ -1,2 +1,4 @@
 /models/
 /__pycahe__/
+/.vscode
+/dataset_wikitext
