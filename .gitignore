@@ -2,3 +2,6 @@
 /__pycahe__/
 /.vscode
 /dataset_wikitext
+/dataset_c4
+/dataset_wikitext-raw
+/out
